@@ -1,0 +1,22 @@
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW
+        run: sudo apt-get update -q && sudo apt-get install -y -q mingw-w64
+      - name: Build
+        run: ./build.sh
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v0.1.${{ github.run_number }}"
+          gh release create "$TAG" out/PopupDesktop.exe --title "팝업 바탕화면 $TAG" --notes "${{ github.event.head_commit.message }}"
