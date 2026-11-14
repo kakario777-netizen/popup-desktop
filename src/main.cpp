@@ -14,6 +14,9 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <commdlg.h>
+#include <commctrl.h>
+#include <exdisp.h>
+#include <servprov.h>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -33,7 +36,12 @@ static HWND g_hwnd;
 static std::wstring g_baseDir, g_dataDir, g_layoutPath, g_backupDir, g_exePath;
 static float S = 1.0f;
 static int CW, CH, ICON1, ICON2, LINEH, MARGIN, PAD, HEAD, RAD;
-static RECT g_screen, g_work;
+static RECT g_screen;          // 가상 화면(모든 모니터) – 창 클라이언트 좌표
+struct Mon { RECT rc, work; };
+static std::vector<Mon> g_mons; // 0번 = 주 모니터
+static POINT g_virt;            // 가상 화면 원점(스크린 좌표)
+static std::wstring g_backupData, g_desktopDir, g_publicDesktop;
+static volatile LONG g_watchGen = 0;
 static UINT WM_TASKBARCREATED;
 static RECT g_paintRc;
 
@@ -171,14 +179,14 @@ struct Entry {
     int gx = -1, gy = -1, gs = 1;
     bool pin = false, pop = false;
     int px = INT_MIN, py = 0, pc = 4, pr = 3;
+    int m = 0;
 };
 static std::map<std::wstring, Entry> g_lay;
-struct Settings { bool firstRunDone = false; int wallMode = 0; std::wstring wallPath; } g_set;
+struct Settings { bool firstRunDone = false; int wallMode = 0; std::wstring wallPath; int mode = -1; bool posImported = false; } g_set;   // mode 0=연동 1=백업
 
 static std::wstring Key(const std::wstring& path) {
-    std::wstring lp = Lower(path), ld = Lower(g_dataDir) + L"\\";
+    std::wstring lp = Lower(path), ld = Lower(g_backupData) + L"\\";
     if (lp.compare(0, ld.size(), ld) == 0) return L"@" + lp.substr(ld.size());
-    if (lp == Lower(g_dataDir)) return L"@";
     return lp;
 }
 static void MoveKeys(const std::wstring& oldPath, const std::wstring& newPath) {
@@ -202,6 +210,8 @@ static bool ParseLayout(const std::string& txt) {
         g_set.firstRunDone = st->num("firstRunDone", 0) != 0;
         g_set.wallMode = (int)st->num("wallMode", 0);
         g_set.wallPath = W16(st->str("wallPath"));
+        g_set.mode = (int)st->num("mode", -1);
+        g_set.posImported = st->num("posImported", 0) != 0;
     }
     if (auto arr = root.get("items")) {
         for (auto& o : arr->a) {
@@ -210,6 +220,7 @@ static bool ParseLayout(const std::string& txt) {
             e.pin = o.num("pin", 0) != 0; e.pop = o.num("pop", 0) != 0;
             e.px = (int)o.num("px", INT_MIN); e.py = (int)o.num("py", 0);
             e.pc = (int)o.num("pc", 4); e.pr = (int)o.num("pr", 3);
+            e.m = (int)o.num("m", 0);
             if (e.gs < 1 || e.gs > 2) e.gs = 1;
             if (e.pc < 1) e.pc = 1; if (e.pr < 1) e.pr = 1;
             g_lay[W16(o.str("k"))] = e;
@@ -255,13 +266,15 @@ static void WriteLayoutFile() {
     std::string o = "{\n\"version\":1,\n\"settings\":{";
     o += "\"firstRunDone\":" + std::string(g_set.firstRunDone ? "true" : "false");
     o += ",\"wallMode\":" + std::to_string(g_set.wallMode);
-    o += ",\"wallPath\":" + JEsc(U8(g_set.wallPath)) + "},\n\"items\":[";
+    o += ",\"wallPath\":" + JEsc(U8(g_set.wallPath));
+    o += ",\"mode\":" + std::to_string(g_set.mode) + ",\"posImported\":" + (g_set.posImported ? "true" : "false");
+    o += "},\n\"items\":[";
     bool first = true;
     for (auto& kv : g_lay) {
         const Entry& e = kv.second;
         o += first ? "\n" : ",\n"; first = false;
         o += "{\"k\":" + JEsc(U8(kv.first)) + ",\"x\":" + std::to_string(e.gx) + ",\"y\":" + std::to_string(e.gy) +
-             ",\"s\":" + std::to_string(e.gs) + ",\"pin\":" + (e.pin ? "1" : "0") + ",\"pop\":" + (e.pop ? "1" : "0");
+             ",\"s\":" + std::to_string(e.gs) + ",\"m\":" + std::to_string(e.m) + ",\"pin\":" + (e.pin ? "1" : "0") + ",\"pop\":" + (e.pop ? "1" : "0");
         if (e.pop) {
             if (e.px != INT_MIN) o += ",\"px\":" + std::to_string(e.px) + ",\"py\":" + std::to_string(e.py);
             o += ",\"pc\":" + std::to_string(e.pc) + ",\"pr\":" + std::to_string(e.pr);
@@ -292,8 +305,9 @@ static void BackupLayoutOnStart() {
 struct Container;
 struct BlurCache { Bitmap* bmp = nullptr; RECT r{}; void* src = nullptr; int gen = -1; ~BlurCache() { delete bmp; } };
 struct Item {
-    std::wstring name, path, target;
+    std::wstring name, path, target, folder;   // folder = 실제로 들어있는 폴더
     bool isDir = false, lnkFolder = false;
+    int mon = 0;
     bool pop = false, pin = false;
     int gx = -1, gy = -1, gs = 1;
     int px = INT_MIN, py = 0, pc = 4, pr = 3, scroll = 0;
@@ -314,6 +328,7 @@ struct Item {
 };
 struct Container {
     std::wstring dir;
+    std::vector<std::wstring> extraDirs;   // 연동 모드: 공용 바탕화면
     bool external = false;
     Item* owner = nullptr;
     std::vector<std::unique_ptr<Item>> items;
@@ -326,21 +341,35 @@ static Item* g_hover = nullptr;
 static Item* g_sel = nullptr;
 static int g_bgGen = 0;
 
-static int RootCols() { return std::max(1, (int)((g_work.right - g_work.left - 2 * MARGIN) / CW)); }
-static int RootRows() { return std::max(1, (int)((g_work.bottom - g_work.top - 2 * MARGIN) / CH)); }
+static int RootCols(int m = 0) { const RECT& w = g_mons[m].work; return std::max(2, (int)((w.right - w.left - 2 * MARGIN) / CW)); }
+static int RootRows(int m = 0) { const RECT& w = g_mons[m].work; return std::max(2, (int)((w.bottom - w.top - 2 * MARGIN) / CH)); }
+static int MonAt(POINT p) {
+    for (int i = 0; i < (int)g_mons.size(); i++) if (PtInRect(&g_mons[i].rc, p)) return i;
+    int best = 0; long long bd = LLONG_MAX;
+    for (int i = 0; i < (int)g_mons.size(); i++) {
+        const RECT& r = g_mons[i].rc;
+        long long dx = p.x < r.left ? r.left - p.x : (p.x > r.right ? p.x - r.right : 0);
+        long long dy = p.y < r.top ? r.top - p.y : (p.y > r.bottom ? p.y - r.bottom : 0);
+        if (dx * dx + dy * dy < bd) { bd = dx * dx + dy * dy; best = i; }
+    }
+    return best;
+}
 
 static void SyncEntry(Item* it) {
     Entry& e = g_lay[Key(it->path)];
     e.gx = it->gx; e.gy = it->gy; e.gs = it->gs; e.pin = it->pin; e.pop = it->pop;
-    e.px = it->px; e.py = it->py; e.pc = it->pc; e.pr = it->pr;
+    e.px = it->px; e.py = it->py; e.pc = it->pc; e.pr = it->pr; e.m = it->mon;
 }
 
 static void AutoPlace(Container* c);
 
 static void LoadContainer(Container* c) {
     c->items.clear();
+    std::vector<std::wstring> dirs = {c->dir};
+    for (auto& x : c->extraDirs) dirs.push_back(x);
+    for (auto& dir : dirs) {
     WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW((c->dir + L"\\*").c_str(), &fd);
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
@@ -348,7 +377,8 @@ static void LoadContainer(Container* c) {
             if (!_wcsicmp(fd.cFileName, L"desktop.ini")) continue;
             auto it = std::make_unique<Item>();
             it->name = fd.cFileName;
-            it->path = c->dir + L"\\" + it->name;
+            it->folder = dir;
+            it->path = dir + L"\\" + it->name;
             it->isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             it->parent = c;
             if (!it->isDir && ExtOf(it->name) == L"lnk") {
@@ -360,11 +390,12 @@ static void LoadContainer(Container* c) {
                 const Entry& e = f->second;
                 it->gx = e.gx; it->gy = e.gy; it->gs = e.gs; it->pin = e.pin;
                 it->pop = e.pop && it->FolderLike();
-                it->px = e.px; it->py = e.py; it->pc = e.pc; it->pr = e.pr;
+                it->px = e.px; it->py = e.py; it->pc = e.pc; it->pr = e.pr; it->mon = e.m;
             }
             c->items.push_back(std::move(it));
         } while (FindNextFileW(h, &fd));
         FindClose(h);
+    }
     }
     AutoPlace(c);
 }
@@ -398,14 +429,39 @@ static void ContDims(Container* c, int& cols, int& rows) {
     bool root = (c == &g_root);
     int maxSpan = 1, maxBottom = 0;
     for (auto& it : c->items) { maxSpan = std::max(maxSpan, it->Span()); maxBottom = std::max(maxBottom, it->gy + it->Span()); }
-    if (root) { cols = std::max(RootCols(), maxSpan); rows = std::max(RootRows(), maxSpan); }
+    if (root) { cols = RootCols(); rows = RootRows(); }
     else {
         cols = std::max(std::max(1, c->owner->pc), maxSpan);
         rows = maxBottom + (int)c->items.size() * 4 / cols + 6;
     }
 }
+static void AutoPlaceRoot(Container* c) {
+    int M = (int)g_mons.size();
+    std::vector<Occ> occ;
+    for (int m = 0; m < M; m++) occ.emplace_back(RootCols(m), RootRows(m));
+    std::vector<Item*> order;
+    for (auto& it : c->items) order.push_back(it.get());
+    std::stable_sort(order.begin(), order.end(), [](Item* a, Item* b) { return a->pin > b->pin; });
+    std::vector<Item*> pending;
+    for (Item* it : order) {
+        int s = it->Span();
+        if (it->mon >= 0 && it->mon < M && it->gx >= 0 && it->gy >= 0 && occ[it->mon].Fits(it->gx, it->gy, s)) occ[it->mon].Mark(it->gx, it->gy, s);
+        else pending.push_back(it);
+    }
+    int overflow = 0;
+    for (Item* it : pending) {
+        int s = it->Span(); bool done = false;
+        for (int m = 0; m < M && !done; m++)
+            for (int x = 0; x < occ[m].cols && !done; x++)
+                for (int y = 0; y < occ[m].rows && !done; y++)
+                    if (occ[m].Fits(x, y, s)) { it->mon = m; it->gx = x; it->gy = y; occ[m].Mark(x, y, s); done = true; }
+        if (!done) { it->mon = 0; it->gx = 0; it->gy = RootRows(0) + 2 * overflow++; }   // 화면이 꽉 참
+        SyncEntry(it);
+    }
+}
 static void AutoPlace(Container* c) {
     bool root = (c == &g_root);
+    if (root) { AutoPlaceRoot(c); return; }
     int cols, rows; ContDims(c, cols, rows);
     if (root) rows += (int)c->items.size() * 4 / cols + 2;   // 넘치면 화면 밖으로
     Occ occ(cols, rows);
@@ -437,12 +493,12 @@ static void AutoPlace(Container* c) {
         SyncEntry(it);
     }
 }
-static bool NearestFree(Container* c, Item* self, int s, int tx, int ty, int& ox, int& oy) {
+static bool NearestFree(Container* c, Item* self, int s, int tx, int ty, int& ox, int& oy, int mon = 0) {
     bool root = (c == &g_root);
     int cols, rows; ContDims(c, cols, rows);
-    if (root) rows = RootRows();
+    if (root) { if (mon < 0 || mon >= (int)g_mons.size()) mon = 0; cols = RootCols(mon); rows = RootRows(mon); }
     Occ occ(cols, rows);
-    for (auto& it : c->items) if (it.get() != self) occ.Mark(it->gx, it->gy, it->Span());
+    for (auto& it : c->items) if (it.get() != self && (!root || it->mon == mon)) occ.Mark(it->gx, it->gy, it->Span());
     long best = LONG_MAX;
     for (int y = 0; y < rows; y++)
         for (int x = 0; x < cols; x++)
@@ -545,33 +601,76 @@ static void LoadBackground() {
     ReleaseDC(nullptr, sdc);
     g_bgOld = (HBITMAP)SelectObject(g_bgDC, g_bgHbm);
 
-    std::wstring path;
-    if (g_set.wallMode == 1 && !g_set.wallPath.empty()) path = g_set.wallPath;
-    else {
-        wchar_t buf[MAX_PATH] = {};
-        SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buf, 0);
-        path = buf;
-    }
     COLORREF cr = GetSysColor(COLOR_DESKTOP);
+    struct Job { std::wstring path; RECT r; int pos; };
+    std::vector<Job> jobs;
+    int pos = 4; // DWPOS_FILL
+    if (g_set.wallMode == 1 && !g_set.wallPath.empty()) {
+        for (auto& m : g_mons) jobs.push_back({g_set.wallPath, m.rc, 4});
+    } else {
+        IDesktopWallpaper* dw = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL, IID_IDesktopWallpaper, (void**)&dw))) {
+            dw->GetBackgroundColor(&cr);
+            DESKTOP_WALLPAPER_POSITION dp; if (SUCCEEDED(dw->GetPosition(&dp))) pos = (int)dp;
+            UINT n = 0; dw->GetMonitorDevicePathCount(&n);
+            for (UINT i = 0; i < n; i++) {
+                LPWSTR id = nullptr;
+                if (FAILED(dw->GetMonitorDevicePathAt(i, &id)) || !id) continue;
+                RECT r; LPWSTR wp = nullptr;
+                if (SUCCEEDED(dw->GetMonitorRECT(id, &r))) {
+                    OffsetRect(&r, -g_virt.x, -g_virt.y);
+                    dw->GetWallpaper(id, &wp);
+                    jobs.push_back({wp ? wp : L"", r, pos});
+                }
+                CoTaskMemFree(wp); CoTaskMemFree(id);
+            }
+            dw->Release();
+        }
+        if (jobs.empty()) {
+            wchar_t buf[MAX_PATH] = {};
+            SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, buf, 0);
+            for (auto& m : g_mons) jobs.push_back({buf, m.rc, 4});
+        }
+        if (pos == 5 && !jobs.empty()) {   // DWPOS_SPAN: 모든 모니터에 한 장
+            RECT u = jobs[0].r; for (auto& j : jobs) UnionRect(&u, &u, &j.r);
+            std::wstring p0 = jobs[0].path; jobs.clear(); jobs.push_back({p0, u, 4});
+        }
+    }
     {
         HBRUSH br = CreateSolidBrush(cr);
         RECT r = {0, 0, w, h}; FillRect(g_bgDC, &r, br); DeleteObject(br);
     }
-    if (!path.empty() && Exists(path)) {
-        Bitmap* img = Bitmap::FromFile(path.c_str());
-        if (img && img->GetLastStatus() == Ok && img->GetWidth() > 0) {
-            Graphics g(g_bgDC);
-            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    {
+        Graphics g(g_bgDC);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(PixelOffsetModeHalf);
+        std::wstring lastPath; Bitmap* img = nullptr;
+        for (auto& j : jobs) {
+            if (j.path.empty() || !Exists(j.path)) continue;
+            if (j.path != lastPath) { delete img; img = Bitmap::FromFile(j.path.c_str()); lastPath = j.path; }
+            if (!img || img->GetLastStatus() != Ok || img->GetWidth() == 0) continue;
             double iw = img->GetWidth(), ih = img->GetHeight();
-            double sc = std::max(w / iw, h / ih);     // 화면 채우기
-            double dw = iw * sc, dh = ih * sc;
-            g.DrawImage(img, RectF((REAL)((w - dw) / 2), (REAL)((h - dh) / 2), (REAL)dw, (REAL)dh));
+            double rw = j.r.right - j.r.left, rh = j.r.bottom - j.r.top;
+            Region old; g.GetClip(&old);
+            g.SetClip(Rect(j.r.left, j.r.top, (INT)rw, (INT)rh));
+            if (j.pos == 1) {             // TILE
+                for (double y = j.r.top; y < j.r.bottom; y += ih)
+                    for (double x = j.r.left; x < j.r.right; x += iw)
+                        g.DrawImage(img, Rect((INT)x, (INT)y, (INT)iw, (INT)ih));
+            } else {
+                double dw = iw, dh = ih;
+                if (j.pos == 2) { dw = rw; dh = rh; }                                       // STRETCH
+                else if (j.pos == 3) { double sc = std::min(rw / iw, rh / ih); dw = iw * sc; dh = ih * sc; }  // FIT
+                else if (j.pos != 0) { double sc = std::max(rw / iw, rh / ih); dw = iw * sc; dh = ih * sc; }  // FILL
+                g.DrawImage(img, RectF((REAL)(j.r.left + (rw - dw) / 2), (REAL)(j.r.top + (rh - dh) / 2), (REAL)dw, (REAL)dh));
+            }
+            g.SetClip(&old);
         }
         delete img;
     }
     // 원본 디코딩 이미지는 버리고 화면 크기 한 장만 유지
     g_bgGp = new Bitmap(w, h, w * 4, PixelFormat32bppRGB, (BYTE*)g_bgBits);
-    g_blurSmall = MakeSmallBlur(g_bgGp, 0, 0, w, h, 320);
+    g_blurSmall = MakeSmallBlur(g_bgGp, 0, 0, w, h, std::max(320, w / 6));
     g_bgGen++;
 }
 
@@ -662,13 +761,15 @@ struct Geo { int ox, oy, cols; RECT clip; };
 static RECT PanelRect(Item* it) {
     int w = it->pc * CW + 2 * PAD, h = HEAD + it->pr * CH + PAD;
     int x = it->px, y = it->py;
-    if (x == INT_MIN) { x = (g_work.left + g_work.right - w) / 2; y = (g_work.top + g_work.bottom - h) / 2; }
-    x = std::max((int)g_work.left, std::min(x, (int)g_work.right - w));
-    y = std::max((int)g_work.top, std::min(y, (int)g_work.bottom - h));
+    if (x == INT_MIN) { const RECT& w0 = g_mons[0].work; x = (w0.left + w0.right - w) / 2; y = (w0.top + w0.bottom - h) / 2; }
+    const RECT& wk = g_mons[MonAt({x + w / 2, y + std::min(h / 2, (int)(40 * S))})].work;
+    x = std::max((int)wk.left, std::min(x, (int)wk.right - w));
+    y = std::max((int)wk.top, std::min(y, (int)wk.bottom - h));
     return {x, y, x + w, y + h};
 }
-static Geo GeoRoot() {
-    Geo g; g.ox = g_work.left + MARGIN; g.oy = g_work.top + MARGIN; g.cols = RootCols(); g.clip = g_work; return g;
+static Geo GeoRoot(int m) {
+    const RECT& w = g_mons[m].work;
+    Geo g; g.ox = w.left + MARGIN; g.oy = w.top + MARGIN; g.cols = RootCols(m); g.clip = w; return g;
 }
 static Geo GeoPanel(Item* it) {
     RECT P = PanelRect(it); Geo g;
@@ -688,7 +789,8 @@ static int LayerOf(Container* c) {
 static bool ItemRect(Item* it, RECT& r) {
     int L = LayerOf(it->parent);
     if (L == -2) return false;
-    r = CellRect(L < 0 ? GeoRoot() : GeoPanel(g_stack[L]), it);
+    if (L < 0 && (it->mon < 0 || it->mon >= (int)g_mons.size())) return false;
+    r = CellRect(L < 0 ? GeoRoot(it->mon) : GeoPanel(g_stack[L]), it);
     return true;
 }
 // 아이콘(또는 폴더 타일) 사각형
@@ -729,8 +831,10 @@ static void DrawIconFit(Graphics& g, Bitmap* b, RectF r) {
     if (!b) return;
     float iw = (float)b->GetWidth(), ih = (float)b->GetHeight();
     float sc = std::min(r.Width / iw, r.Height / ih);
-    float w = iw * sc, h = ih * sc;
-    g.DrawImage(b, RectF(r.X + (r.Width - w) / 2, r.Y + (r.Height - h) / 2, w, h));
+    if (sc > 0.98f && sc < 1.02f) sc = 1.0f;
+    int w = (int)std::lround(iw * sc), h = (int)std::lround(ih * sc);
+    int x = (int)std::lround(r.X + (r.Width - w) / 2), y = (int)std::lround(r.Y + (r.Height - h) / 2);
+    g.DrawImage(b, Rect(x, y, w, h), 0, 0, (INT)iw, (INT)ih, UnitPixel);   // 정수 좌표 → 선명하게
 }
 
 static Item* g_dragItem = nullptr; static bool g_dragging = false;
@@ -786,9 +890,10 @@ static void DrawItem(Graphics& g, Item* it, const RECT& R, bool hl) {
     DrawLabel(g, it->Label(), lr);
 }
 
-static void DrawItems(Graphics& g, Container* c, const Geo& geo) {
+static void DrawItems(Graphics& g, Container* c, const Geo& geo, int mon = -1) {
     for (auto& up : c->items) {
         Item* it = up.get();
+        if (mon >= 0 && it->mon != mon) continue;
         if (g_dragging && it == g_dragItem) continue;
         RECT R = CellRect(geo, it);
         if (!Hits(R, geo.clip) || !Hits(R, g_paintRc)) continue;
@@ -836,14 +941,15 @@ static void DrawPanel(Graphics& g, Item* it) {
     for (int i = 1; i <= 3; i++) g.DrawLine(&gpn, bx - i * 4 * S, by, bx, by - i * 4 * S);
 }
 
-static void SetupG(Graphics& g) {
+static void SetupG(Graphics& g, bool opaque = false) {
     g.SetSmoothingMode(SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    g.SetTextRenderingHint(opaque ? TextRenderingHintClearTypeGridFit : TextRenderingHintAntiAliasGridFit);
     g.SetInterpolationMode(InterpolationModeHighQualityBilinear);
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
 }
 static void DrawSceneBelow(Graphics& g, int depth) {
-    DrawItems(g, &g_root, GeoRoot());
+    for (int m = 0; m < (int)g_mons.size(); m++)
+        if (Hits(g_mons[m].rc, g_paintRc)) DrawItems(g, &g_root, GeoRoot(m), m);
     for (int i = 0; i < depth && i < (int)g_stack.size(); i++) DrawPanel(g, g_stack[i]);
 }
 
@@ -855,7 +961,7 @@ static void ComputeSceneBlur(Item* it, int depth) {
     {
         Graphics g(&full); SetupG(g);
         g.TranslateTransform((REAL)-P.left, (REAL)-P.top);
-        g.DrawImage(g_bgGp, P.left, P.top, P.left, P.top, w, h, UnitPixel);
+        g.DrawImage(g_bgGp, Rect(P.left, P.top, w, h), P.left, P.top, w, h, UnitPixel);
         RECT saved = g_paintRc; g_paintRc = P;
         DrawSceneBelow(g, depth);
         g_paintRc = saved;
@@ -926,6 +1032,10 @@ static void OpenPopup(Item* it) {
     if (it->child && it->child->external) { it->child.reset(); }
     Child(it);
     if (it->px == INT_MIN) {
+        RECT T = TileRect(it);
+        const RECT& wk = g_mons[MonAt({(T.left + T.right) / 2, (T.top + T.bottom) / 2})].work;
+        int w = it->pc * CW + 2 * PAD, h = HEAD + it->pr * CH + PAD;
+        it->px = (wk.left + wk.right - w) / 2; it->py = (wk.top + wk.bottom - h) / 2;
         RECT P = PanelRect(it); it->px = P.left; it->py = P.top;
     }
     it->scroll = 0;
@@ -949,12 +1059,12 @@ static void ClosePopups(int keepCount, bool animate) {
 
 // ───────────────────────── 히트 테스트 ─────────────────────────
 enum Area { A_NONE, A_ITEM, A_BODY, A_HEADER, A_GRIP, A_ROOT };
-struct Hit { int layer = -1; Item* item = nullptr; Area area = A_ROOT; };
-static Item* ItemAt(Container* c, const Geo& geo, POINT pt, Item* ignore) {
+struct Hit { int layer = -1; Item* item = nullptr; Area area = A_ROOT; int mon = 0; };
+static Item* ItemAt(Container* c, const Geo& geo, POINT pt, Item* ignore, int mon = -1) {
     if (!PtInRect(&geo.clip, pt)) return nullptr;
     for (auto& up : c->items) {
         Item* it = up.get();
-        if (it == ignore) continue;
+        if (it == ignore || (mon >= 0 && it->mon != mon)) continue;
         RECT R = CellRect(geo, it); InflateRect(&R, -(int)(3 * S), -(int)(2 * S));
         if (PtInRect(&R, pt)) return it;
     }
@@ -974,14 +1084,15 @@ static Hit HitTest(POINT pt, Item* ignore = nullptr) {
         return h;
     }
     h.layer = -1;
-    h.item = ItemAt(&g_root, GeoRoot(), pt, ignore);
+    h.mon = MonAt(pt);
+    h.item = ItemAt(&g_root, GeoRoot(h.mon), pt, ignore, h.mon);
     h.area = h.item ? A_ITEM : A_ROOT;
     return h;
 }
 static Container* ContOfLayer(int L) { return L < 0 ? &g_root : Child(g_stack[L]); }
-static Geo GeoOfLayer(int L) { return L < 0 ? GeoRoot() : GeoPanel(g_stack[L]); }
-static void CellAt(int L, POINT pt, int& cx, int& cy) {
-    Geo g = GeoOfLayer(L);
+static Geo GeoOfLayer(int L, int mon) { return L < 0 ? GeoRoot(mon) : GeoPanel(g_stack[L]); }
+static void CellAt(int L, int mon, POINT pt, int& cx, int& cy) {
+    Geo g = GeoOfLayer(L, mon);
     cx = (int)std::floor((pt.x - g.ox) / (double)CW);
     cy = (int)std::floor((pt.y - g.oy) / (double)CH);
     if (cx < 0) cx = 0; if (cy < 0) cy = 0;
@@ -996,9 +1107,9 @@ static bool ShellOp(UINT func, const std::vector<std::wstring>& from, const std:
     op.fFlags = flags;
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
 }
-static void MoveItemTo(Item* it, const std::wstring& dstDir, int gx, int gy) {
+static void MoveItemTo(Item* it, const std::wstring& dstDir, int gx, int gy, int mon = 0) {
     if (it->pin) return;
-    std::wstring srcDir = it->parent->dir;
+    std::wstring srcDir = it->folder;
     if (!_wcsicmp(srcDir.c_str(), dstDir.c_str())) return;
     if (it->isDir && (StartsWithI(dstDir + L"\\", it->path + L"\\"))) return;  // 자기 안으로 이동 금지
     std::wstring newPath = dstDir + L"\\" + it->name;
@@ -1007,7 +1118,7 @@ static void MoveItemTo(Item* it, const std::wstring& dstDir, int gx, int gy) {
     if (ShellOp(FO_MOVE, {it->path}, dstDir, FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR)) {
         MoveKeys(it->path, newPath);
         Entry& e = g_lay[Key(newPath)];
-        e.gx = gx; e.gy = gy;
+        e.gx = gx; e.gy = gy; e.m = mon;
     }
     RebuildAll();
 }
@@ -1018,7 +1129,7 @@ static void DeleteItem(Item* it) {
     RebuildAll();
 }
 static void Launch(Item* it) {
-    ShellExecuteW(g_hwnd, nullptr, it->path.c_str(), nullptr, it->parent->dir.c_str(), SW_SHOWNORMAL);
+    ShellExecuteW(g_hwnd, nullptr, it->path.c_str(), nullptr, it->folder.c_str(), SW_SHOWNORMAL);
 }
 
 // ───────────────────────── 이름 바꾸기 ─────────────────────────
@@ -1034,7 +1145,7 @@ static void EndRename(bool commit) {
         std::wstring ext = ExtOf(it->name);
         if (!it->isDir && (ext == L"lnk" || ext == L"url")) nn += L"." + ext;
         if (!nn.empty() && nn != it->name && nn.find_first_of(L"\\/:*?\"<>|") == std::wstring::npos) {
-            std::wstring np = it->parent->dir + L"\\" + nn;
+            std::wstring np = it->folder + L"\\" + nn;
             SyncEntry(it);
             if (!Exists(np) && MoveFileW(it->path.c_str(), np.c_str())) MoveKeys(it->path, np);
             else MessageBoxW(g_hwnd, L"이름을 바꿀 수 없어요.", L"팝업 바탕화면", MB_ICONINFORMATION);
@@ -1067,7 +1178,7 @@ static void StartRename(Item* it) {
 }
 
 // 새 폴더 만들기
-static void NewFolder(int L, int cx, int cy, bool popup) {
+static void NewFolder(int L, int mon, int cx, int cy, bool popup) {
     Container* c = ContOfLayer(L);
     std::wstring name = UniqueName(c->dir, popup ? L"새 팝업 폴더" : L"새 폴더");
     std::wstring p = c->dir + L"\\" + name;
@@ -1077,12 +1188,13 @@ static void NewFolder(int L, int cx, int cy, bool popup) {
     int s = popup ? 2 : 1, ox = cx, oy = cy;
     // 같은 컨테이너 자리 확인용 임시 아이템 없이 근처 빈칸
     Item tmp; tmp.gs = s; tmp.pop = popup;
-    if (NearestFree(c, nullptr, s, cx, cy, ox, oy)) { e.gx = ox; e.gy = oy; }
+    e.m = mon;
+    if (NearestFree(c, nullptr, s, cx, cy, ox, oy, mon)) { e.gx = ox; e.gy = oy; }
     RebuildAll();
     for (auto& it : ContOfLayer(L < (int)g_stack.size() ? L : -1)->items)
         if (Key(it->path) == Key(p)) { StartRename(it.get()); break; }
 }
-static void LinkFolder(int L, int cx, int cy) {
+static void LinkFolder(int L, int mon, int cx, int cy) {
     std::wstring t = PickFolder(g_hwnd, L"팝업으로 연결할 폴더를 고르세요");
     if (t.empty()) return;
     Container* c = ContOfLayer(L);
@@ -1091,7 +1203,8 @@ static void LinkFolder(int L, int cx, int cy) {
     if (!CreateLnk(lnk, t)) return;
     Entry& e = g_lay[Key(lnk)];
     e.pop = true;
-    int ox, oy; if (NearestFree(c, nullptr, 2, cx, cy, ox, oy)) { e.gx = ox; e.gy = oy; }
+    e.m = mon;
+    int ox, oy; if (NearestFree(c, nullptr, 2, cx, cy, ox, oy, mon)) { e.gx = ox; e.gy = oy; }
     RebuildAll();
 }
 
@@ -1108,10 +1221,108 @@ static std::wstring Category(const WIN32_FIND_DATAW& fd) {
     if (in({L"zip", L"rar", L"7z", L"tar", L"gz", L"egg", L"alz", L"iso"})) return L"압축";
     return L"기타";
 }
+// ── 백업 모드: 목록에서 골라 복사 ──
+struct ImpRow { std::wstring path, name, cat; unsigned long long size = 0; };
+static std::vector<ImpRow> g_imp;
+static HWND g_impList = nullptr, g_impInfo = nullptr, g_impOkBtn = nullptr;
+static int g_impResult = 0;
+static unsigned long long g_impFree = 0;
+static HFONT g_uiFont = nullptr;
+static void ImpRefresh() {
+    unsigned long long sum = 0; int cnt = 0;
+    for (int i = 0; i < (int)g_imp.size(); i++) if (ListView_GetCheckState(g_impList, i)) { sum += g_imp[i].size; cnt++; }
+    std::wstring t = L"선택 " + std::to_wstring(cnt) + L"개 · " + SizeStr(sum) + L"   |   저장할 곳 남은 공간 " + SizeStr(g_impFree);
+    if (sum > g_impFree) t += L"   (공간 부족 — 큰 항목을 빼 주세요)";
+    SetWindowTextW(g_impInfo, t.c_str());
+    EnableWindow(g_impOkBtn, cnt > 0 && sum <= g_impFree);
+}
+static LRESULT CALLBACK ImpProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_NOTIFY: {
+        NMHDR* nh = (NMHDR*)l;
+        if (nh->hwndFrom == g_impList && nh->code == LVN_ITEMCHANGED) {
+            NMLISTVIEW* nl = (NMLISTVIEW*)l;
+            if ((nl->uChanged & LVIF_STATE) && ((nl->uNewState ^ nl->uOldState) & LVIS_STATEIMAGEMASK)) ImpRefresh();
+        }
+        break;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDOK: g_impResult = 1; break;
+        case IDCANCEL: g_impResult = 2; break;
+        case 3001: case 3002: case 3003:
+            for (int i = 0; i < (int)g_imp.size(); i++)
+                ListView_SetCheckState(g_impList, i, LOWORD(w) == 3001 || (LOWORD(w) == 3003 && g_imp[i].size < 100ull * 1048576));
+            ImpRefresh();
+            break;
+        }
+        return 0;
+    case WM_CLOSE: g_impResult = 2; return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static bool ImportDialog(std::vector<bool>& checks) {
+    static bool reg = false;
+    g_impInfo = g_impOkBtn = nullptr;
+    HINSTANCE hi = GetModuleHandleW(nullptr);
+    if (!reg) {
+        WNDCLASSW wc = {}; wc.lpfnWndProc = ImpProc; wc.hInstance = hi; wc.lpszClassName = L"PopupDesktopImport";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        RegisterClassW(&wc); reg = true;
+    }
+    ULARGE_INTEGER fr; g_impFree = GetDiskFreeSpaceExW(g_backupData.c_str(), &fr, nullptr, nullptr) ? fr.QuadPart : 0;
+    int W = (int)(660 * S), H = (int)(560 * S);
+    const RECT& wk = g_mons[0].work;
+    int x = g_virt.x + (wk.left + wk.right - W) / 2, y = g_virt.y + (wk.top + wk.bottom - H) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"PopupDesktopImport", L"바탕화면 자료 가져오기 (백업 모드)",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, W, H, g_hwnd, nullptr, hi, nullptr);
+    RECT cr; GetClientRect(dlg, &cr);
+    int cw = cr.right, ch = cr.bottom, m = (int)(12 * S), bh = (int)(30 * S), bw = (int)(110 * S);
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int X, int Y, int Wd, int Ht, int id) {
+        HWND c = CreateWindowExW(0, cls, t, WS_CHILD | WS_VISIBLE | st, X, Y, Wd, Ht, dlg, (HMENU)(INT_PTR)id, hi, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)g_uiFont, TRUE);
+        return c;
+    };
+    mk(L"STATIC", L"가져올 항목을 체크하세요. 체크한 항목만 '내 문서\\팝업 바탕화면'에 복사돼요. (원본은 그대로)", 0, m, m, cw - 2 * m, (int)(20 * S), 0);
+    g_impList = mk(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, m, m + (int)(26 * S), cw - 2 * m, ch - (int)(26 * S) - 3 * m - 2 * bh, 0);
+    ListView_SetExtendedListViewStyle(g_impList, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    LVCOLUMNW col = {}; col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+    col.pszText = (LPWSTR)L"이름"; col.cx = cw - 2 * m - (int)(230 * S); ListView_InsertColumn(g_impList, 0, &col);
+    col.pszText = (LPWSTR)L"분류"; col.cx = (int)(90 * S); ListView_InsertColumn(g_impList, 1, &col);
+    col.fmt = LVCFMT_RIGHT; col.pszText = (LPWSTR)L"크기"; col.cx = (int)(110 * S); ListView_InsertColumn(g_impList, 2, &col);
+    for (int i = 0; i < (int)g_imp.size(); i++) {
+        LVITEMW it = {}; it.mask = LVIF_TEXT; it.iItem = i; it.pszText = (LPWSTR)g_imp[i].name.c_str();
+        ListView_InsertItem(g_impList, &it);
+        ListView_SetItemText(g_impList, i, 1, (LPWSTR)g_imp[i].cat.c_str());
+        std::wstring sz = SizeStr(g_imp[i].size);
+        ListView_SetItemText(g_impList, i, 2, (LPWSTR)sz.c_str());
+        ListView_SetCheckState(g_impList, i, g_imp[i].size < 100ull * 1048576);
+    }
+    int by = ch - m - bh;
+    g_impInfo = mk(L"STATIC", L"", 0, m, by - bh, cw - 2 * m, (int)(22 * S), 0);
+    mk(L"BUTTON", L"전체 선택", BS_PUSHBUTTON, m, by, bw, bh, 3001);
+    mk(L"BUTTON", L"전체 해제", BS_PUSHBUTTON, m + bw + m / 2, by, bw, bh, 3002);
+    mk(L"BUTTON", L"100MB 미만만", BS_PUSHBUTTON, m + 2 * (bw + m / 2), by, bw, bh, 3003);
+    mk(L"BUTTON", L"취소", BS_PUSHBUTTON, cw - m - bw, by, bw, bh, IDCANCEL);
+    g_impOkBtn = mk(L"BUTTON", L"가져오기", BS_DEFPUSHBUTTON, cw - 2 * m - 2 * bw + m / 2, by, bw, bh, IDOK);
+    ImpRefresh();
+    ShowWindow(dlg, SW_SHOW); SetForegroundWindow(dlg);
+    EnableWindow(g_hwnd, FALSE);
+    g_impResult = 0;
+    MSG msg;
+    while (g_impResult == 0 && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    checks.assign(g_imp.size(), false);
+    for (int i = 0; i < (int)g_imp.size(); i++) checks[i] = ListView_GetCheckState(g_impList, i) != 0;
+    EnableWindow(g_hwnd, TRUE);
+    DestroyWindow(dlg);
+    return g_impResult == 1;
+}
 static void ImportDesktop() {
-    std::map<std::wstring, std::vector<std::wstring>> cats;
-    unsigned long long total = 0; int count = 0;
-    for (auto& d : {KnownFolder(FOLDERID_Desktop), KnownFolder(FOLDERID_PublicDesktop)}) {
+    g_imp.clear();
+    HCURSOR oc = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    for (auto& d : {g_desktopDir, g_publicDesktop}) {
         if (d.empty()) continue;
         WIN32_FIND_DATAW fd;
         HANDLE h = FindFirstFileW((d + L"\\*").c_str(), &fd);
@@ -1120,38 +1331,158 @@ static void ImportDesktop() {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
             if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
             if (!_wcsicmp(fd.cFileName, L"desktop.ini")) continue;
-            std::wstring p = d + L"\\" + fd.cFileName;
-            if (!_wcsicmp(p.c_str(), g_exePath.c_str())) continue;
-            cats[Category(fd)].push_back(p);
-            total += (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? DirSize(p)
+            ImpRow r;
+            r.path = d + L"\\" + fd.cFileName;
+            if (!_wcsicmp(r.path.c_str(), g_exePath.c_str())) continue;
+            r.name = fd.cFileName; r.cat = Category(fd);
+            r.size = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? DirSize(r.path)
                      : (((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
-            count++;
+            g_imp.push_back(r);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    if (count == 0) {
-        MessageBoxW(g_hwnd, L"가져올 바탕화면 자료가 없어요.", L"팝업 바탕화면", MB_ICONINFORMATION);
-        return;
-    }
-    std::wstring q = L"기존 바탕화면 자료를 가져올까요?\n\n항목 " + std::to_wstring(count) + L"개, 약 " + SizeStr(total) +
-                     L"\n원본은 그대로 두고 '복사'해서 종류별 팝업 폴더로 정리해요.";
-    if (MessageBoxW(g_hwnd, q.c_str(), L"팝업 바탕화면", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    SetCursor(oc);
+    if (g_imp.empty()) { MessageBoxW(g_hwnd, L"가져올 바탕화면 자료가 없어요.", L"팝업 바탕화면", MB_ICONINFORMATION); return; }
     const wchar_t* order[] = {L"바로가기", L"폴더", L"문서", L"이미지", L"영상", L"음악", L"압축", L"기타"};
+    auto rank = [&](const std::wstring& c) { for (int i = 0; i < 8; i++) if (c == order[i]) return i; return 8; };
+    std::stable_sort(g_imp.begin(), g_imp.end(), [&](const ImpRow& a, const ImpRow& b) {
+        int ra = rank(a.cat), rb = rank(b.cat); return ra != rb ? ra < rb : _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+    std::vector<bool> chk;
+    if (!ImportDialog(chk)) return;
+    std::map<std::wstring, std::vector<std::wstring>> cats;
+    for (size_t i = 0; i < g_imp.size(); i++) if (chk[i]) cats[g_imp[i].cat].push_back(g_imp[i].path);
     for (auto cn : order) {
         auto f = cats.find(cn);
         if (f == cats.end()) continue;
-        std::wstring dir = g_dataDir + L"\\" + cn;
+        std::wstring dir = g_backupData + L"\\" + cn;
         CreateDirectoryW(dir.c_str(), nullptr);
         ShellOp(FO_COPY, f->second, dir, FOF_NOCONFIRMMKDIR | FOF_RENAMEONCOLLISION);
         Entry& e = g_lay[Key(dir)];
-        e.pop = true; e.gx = -1; e.gy = -1;
-        int n = (int)f->second.size();
-        e.pc = n <= 4 ? std::max(2, n) : (n <= 12 ? 4 : 5);
-        e.pr = std::max(1, std::min(4, (n + e.pc - 1) / e.pc));
+        if (!e.pop) {
+            e.pop = true; e.gx = -1; e.gy = -1;
+            int n = (int)f->second.size();
+            e.pc = n <= 4 ? std::max(2, n) : (n <= 12 ? 4 : 5);
+            e.pr = std::max(1, std::min(4, (n + e.pc - 1) / e.pc));
+        }
     }
     RebuildAll();
     MessageBoxW(g_hwnd, L"복사가 끝났어요.\n\n이제 기존 바탕화면은 정리하시는 걸 추천드립니다.\n(원본 파일은 그대로 남아 있어요)",
                 L"팝업 바탕화면", MB_ICONINFORMATION);
+}
+
+// ── 연동 모드: 윈도우 바탕화면 아이콘 위치 읽기 (원본은 건드리지 않음) ──
+static const GUID kSID_STopLevelBrowser = {0x4C96BE40, 0x915C, 0x11CF, {0x99, 0xD3, 0x00, 0xAA, 0x00, 0x4A, 0xE8, 0x37}};
+static void ImportWinPositions() {
+    IShellWindows* sw = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_IShellWindows, (void**)&sw))) return;
+    VARIANT ve; VariantInit(&ve);
+    long hwnd = 0; IDispatch* disp = nullptr;
+    std::map<std::wstring, POINT> pos; POINT spacing = {0, 0};
+    if (SUCCEEDED(sw->FindWindowSW(&ve, &ve, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, &disp)) && disp) {
+        IServiceProvider* sp = nullptr;
+        if (SUCCEEDED(disp->QueryInterface(IID_IServiceProvider, (void**)&sp))) {
+            IShellBrowser* sb = nullptr;
+            if (SUCCEEDED(sp->QueryService(kSID_STopLevelBrowser, IID_IShellBrowser, (void**)&sb))) {
+                IShellView* sv = nullptr;
+                if (SUCCEEDED(sb->QueryActiveShellView(&sv))) {
+                    IFolderView* fv = nullptr;
+                    if (SUCCEEDED(sv->QueryInterface(IID_IFolderView, (void**)&fv))) {
+                        fv->GetSpacing(&spacing);
+                        IShellFolder* sf = nullptr;
+                        if (SUCCEEDED(fv->GetFolder(IID_IShellFolder, (void**)&sf))) {
+                            int n = 0; fv->ItemCount(SVGIO_ALLVIEW, &n);
+                            for (int i = 0; i < n; i++) {
+                                PITEMID_CHILD pidl = nullptr;
+                                if (FAILED(fv->Item(i, &pidl)) || !pidl) continue;
+                                POINT pt;
+                                STRRET sr;
+                                if (SUCCEEDED(fv->GetItemPosition(pidl, &pt)) && SUCCEEDED(sf->GetDisplayNameOf(pidl, SHGDN_FORPARSING, &sr))) {
+                                    LPWSTR nm = nullptr;
+                                    if (SUCCEEDED(StrRetToStrW(&sr, pidl, &nm)) && nm) { pos[Lower(nm)] = pt; CoTaskMemFree(nm); }
+                                }
+                                CoTaskMemFree(pidl);
+                            }
+                            sf->Release();
+                        }
+                        fv->Release();
+                    }
+                    sv->Release();
+                }
+                sb->Release();
+            }
+            sp->Release();
+        }
+        disp->Release();
+    }
+    sw->Release();
+    if (pos.empty()) return;
+    if (spacing.x < 20) spacing.x = CW;
+    if (spacing.y < 20) spacing.y = CH;
+    for (auto& up : g_root.items) {
+        Item* it = up.get();
+        auto f = pos.find(Lower(it->path));
+        if (f == pos.end()) continue;
+        POINT p = f->second;
+        POINT c = {p.x + spacing.x / 2, p.y + spacing.y / 2};
+        int m = MonAt(c);
+        const RECT& wk = g_mons[m].work;
+        it->mon = m;
+        it->gx = std::max(0, (int)std::lround((p.x - wk.left) / (double)spacing.x));
+        it->gy = std::max(0, (int)std::lround((p.y - wk.top) / (double)spacing.y));
+        if (it->gx >= RootCols(m) || it->gy >= RootRows(m)) it->gx = it->gy = -1;
+        SyncEntry(it);
+    }
+    g_set.posImported = true;
+    RebuildAll();
+}
+
+// ── 모드 ──
+static DWORD WINAPI WatchThread(LPVOID);
+static void ApplyMode(int mode) {
+    SaveTree(&g_root);
+    g_set.mode = mode;
+    g_root.extraDirs.clear();
+    if (mode == 0) {
+        g_dataDir = g_desktopDir;
+        if (!g_publicDesktop.empty() && IsDirPath(g_publicDesktop)) g_root.extraDirs.push_back(g_publicDesktop);
+    } else g_dataDir = g_backupData;
+    g_root.dir = g_dataDir;
+    InterlockedIncrement(&g_watchGen);
+    CreateThread(nullptr, 0, WatchThread, (LPVOID)(LONG_PTR)g_watchGen, 0, nullptr);
+    g_stack.clear();
+    RebuildAll();
+}
+static int AskMode() {
+    TASKDIALOG_BUTTON btns[] = {
+        {1001, L"연동 모드\n실제 바탕화면 폴더를 그대로 써요. 복사하지 않아 용량이 들지 않고, 삭제·새 폴더는 실제 바탕화면에도 반영돼요. "
+               L"아이콘 위치는 지금 바탕화면 배치를 읽어 오고, 이후 옮기는 건 이 프로그램에만 저장돼요."},
+        {1002, L"백업 모드\n가져올 자료를 목록에서 골라 '내 문서\\팝업 바탕화면'에 복사해요. 원본 바탕화면과는 따로 관리돼요."}};
+    TASKDIALOGCONFIG c = {};
+    c.cbSize = sizeof c; c.hwndParent = g_hwnd;
+    c.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    c.pszWindowTitle = L"팝업 바탕화면";
+    c.pszMainInstruction = L"바탕화면 자료를 어떻게 사용할까요?";
+    c.pszContent = L"나중에 바탕화면 우클릭 → 모드에서 바꿀 수 있어요.";
+    c.cButtons = 2; c.pButtons = btns; c.nDefaultButton = 1001;
+    int b = 0;
+    if (FAILED(TaskDialogIndirect(&c, &b, nullptr, nullptr))) return -1;
+    return b == 1001 ? 0 : (b == 1002 ? 1 : -1);
+}
+static void ChooseMode(int mode) {
+    if (mode < 0) return;
+    ApplyMode(mode);
+    g_set.firstRunDone = true;
+    ScheduleSave();
+    if (mode == 0) {
+        if (!g_set.posImported) ImportWinPositions();
+        MessageBoxW(g_hwnd, L"바탕화면을 그대로 연결했어요.\n\n이제 기존 바탕화면 정리는 이 프로그램에서 하시는 걸 추천드립니다.\n"
+                            L"(원래 윈도우 바탕화면의 아이콘 위치는 바뀌지 않아요)", L"팝업 바탕화면", MB_ICONINFORMATION);
+    } else {
+        bool empty = true;
+        for (auto& it : g_root.items) { (void)it; empty = false; break; }
+        if (empty) ImportDesktop();
+    }
 }
 
 // ───────────────────────── 창 / 바탕화면 붙이기 ─────────────────────────
@@ -1170,8 +1501,26 @@ static void AttachToDesktop() {
     SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 static void UpdateMetrics() {
-    g_screen = {0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &g_work, 0);
+    g_virt = {GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)};
+    g_screen = {0, 0, GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+    struct T { RECT rc, work; bool primary; };
+    std::vector<T> v;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hm, HDC, LPRECT, LPARAM lp) -> BOOL {
+        MONITORINFO mi = {sizeof mi};
+        if (GetMonitorInfoW(hm, &mi)) ((std::vector<T>*)lp)->push_back({mi.rcMonitor, mi.rcWork, (mi.dwFlags & MONITORINFOF_PRIMARY) != 0});
+        return TRUE;
+    }, (LPARAM)&v);
+    std::stable_sort(v.begin(), v.end(), [](const T& a, const T& b) {
+        if (a.primary != b.primary) return a.primary;
+        return a.rc.left != b.rc.left ? a.rc.left < b.rc.left : a.rc.top < b.rc.top;
+    });
+    g_mons.clear();
+    for (auto& t : v) {
+        Mon m{t.rc, t.work};
+        OffsetRect(&m.rc, -g_virt.x, -g_virt.y); OffsetRect(&m.work, -g_virt.x, -g_virt.y);
+        g_mons.push_back(m);
+    }
+    if (g_mons.empty()) g_mons.push_back({g_screen, g_screen});
 }
 static bool AutoStartOn() {
     HKEY k; bool on = false;
@@ -1247,7 +1596,12 @@ static void ShowMenu(POINT pt) {
             AppendMenuW(wm, MF_STRING | (g_set.wallMode == 0 ? MF_CHECKED : 0), 110, L"윈도우 배경화면 사용");
             AppendMenuW(wm, MF_STRING | (g_set.wallMode == 1 ? MF_CHECKED : 0), 111, L"전용 배경화면 선택...");
             AppendMenuW(m, MF_POPUP, (UINT_PTR)wm, L"배경화면");
-            AppendMenuW(m, MF_STRING, 112, L"기존 바탕화면 자료 가져오기");
+            HMENU mm = CreatePopupMenu();
+            AppendMenuW(mm, MF_STRING | (g_set.mode == 0 ? MF_CHECKED : 0), 120, L"연동 모드 (실제 바탕화면 사용)");
+            AppendMenuW(mm, MF_STRING | (g_set.mode == 1 ? MF_CHECKED : 0), 121, L"백업 모드 (골라서 복사)");
+            AppendMenuW(m, MF_POPUP, (UINT_PTR)mm, L"모드");
+            if (g_set.mode == 1) AppendMenuW(m, MF_STRING, 112, L"바탕화면 자료 골라서 가져오기...");
+            else AppendMenuW(m, MF_STRING, 116, L"윈도우 바탕화면 배치 다시 읽기");
             AppendMenuW(m, MF_STRING, 113, L"자료 폴더 열기");
             AppendMenuW(m, MF_STRING | (AutoStartOn() ? MF_CHECKED : 0), 114, L"윈도우 시작 시 자동 실행");
             AppendMenuW(m, MF_STRING, 115, L"새로고침");
@@ -1258,7 +1612,7 @@ static void ShowMenu(POINT pt) {
     SetForegroundWindow(g_hwnd);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, sp.x, sp.y, 0, g_hwnd, nullptr);
     DestroyMenu(m);
-    int cx, cy; CellAt(h.layer, pt, cx, cy);
+    int cx, cy; CellAt(h.layer, h.mon, pt, cx, cy);
     Item* sizeTarget = it ? it : panel;
     switch (cmd) {
     case 301: if (it->pop) OpenPopup(it); else Launch(it); break;
@@ -1267,7 +1621,7 @@ static void ShowMenu(POINT pt) {
         it->pop = true;
         if (!ContOfLayer(h.layer)) break;
         int ox, oy;
-        if (NearestFree(it->parent, it, 2, it->gx, it->gy, ox, oy)) { it->gx = ox; it->gy = oy; }
+        if (NearestFree(it->parent, it, 2, it->gx, it->gy, ox, oy, it->mon)) { it->gx = ox; it->gy = oy; }
         SyncEntry(it); RebuildAll(); break;
     }
     case 304: it->pop = false; it->gs = 1; SyncEntry(it); RebuildAll(); break;
@@ -1276,12 +1630,12 @@ static void ShowMenu(POINT pt) {
     case 307: DeleteItem(it); break;
     case 310: case 311: {
         int s = cmd - 309, ox, oy;
-        if (NearestFree(it->parent, it, s, it->gx, it->gy, ox, oy)) { it->gs = s; it->gx = ox; it->gy = oy; delete it->icon; it->icon = nullptr; it->iconPx = 0; }
+        if (NearestFree(it->parent, it, s, it->gx, it->gy, ox, oy, it->mon)) { it->gs = s; it->gx = ox; it->gy = oy; delete it->icon; it->icon = nullptr; it->iconPx = 0; }
         SyncEntry(it); ScheduleSave(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     }
-    case 101: NewFolder(h.layer, cx, cy, true); break;
-    case 102: NewFolder(h.layer, cx, cy, false); break;
-    case 103: LinkFolder(h.layer, cx, cy); break;
+    case 101: NewFolder(h.layer, h.mon, cx, cy, true); break;
+    case 102: NewFolder(h.layer, h.mon, cx, cy, false); break;
+    case 103: LinkFolder(h.layer, h.mon, cx, cy); break;
     case 104: ShellExecuteW(g_hwnd, nullptr, panel->Dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
     case 110: g_set.wallMode = 0; LoadBackground(); ScheduleSave(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     case 111: {
@@ -1299,6 +1653,13 @@ static void ShowMenu(POINT pt) {
         break;
     }
     case 112: ImportDesktop(); break;
+    case 116:
+        if (MessageBoxW(g_hwnd, L"윈도우 바탕화면의 현재 아이콘 위치대로 다시 배치할까요?\n(지금 이 프로그램에서 옮겨 둔 위치는 바뀌어요)",
+                        L"팝업 바탕화면", MB_YESNO | MB_ICONQUESTION) == IDYES) ImportWinPositions();
+        break;
+    case 120: case 121:
+        if (g_set.mode != cmd - 120) ChooseMode(cmd - 120);
+        break;
     case 113: ShellExecuteW(g_hwnd, nullptr, g_dataDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
     case 114: SetAutoStart(!AutoStartOn()); break;
     case 115: LoadBackground(); RebuildAll(); break;
@@ -1347,15 +1708,16 @@ static void EndDrag(POINT pt) {
     if (h.layer >= 0 && g_stack[h.layer] == it) return;
     Container* dst = ContOfLayer(h.layer);
     POINT tl = {pt.x - g_grab.x + CW / 2, pt.y - g_grab.y + CH / 2};
-    int cx, cy; CellAt(h.layer, tl, cx, cy);
+    int tm = h.layer < 0 ? MonAt(tl) : 0;
+    int cx, cy; CellAt(h.layer, tm, tl, cx, cy);
     if (dst == it->parent) {
         int ox, oy;
-        if (NearestFree(dst, it, it->Span(), cx, cy, ox, oy)) { it->gx = ox; it->gy = oy; SyncEntry(it); ScheduleSave(); }
+        if (NearestFree(dst, it, it->Span(), cx, cy, ox, oy, tm)) { it->gx = ox; it->gy = oy; it->mon = h.layer < 0 ? tm : it->mon; SyncEntry(it); ScheduleSave(); }
         for (int i = 0; i < (int)g_stack.size(); i++) ComputeSceneBlur(g_stack[i], i);
     } else {
         int ox = cx, oy = cy;
-        NearestFree(dst, nullptr, it->Span(), cx, cy, ox, oy);
-        MoveItemTo(it, dst->dir, ox, oy);
+        NearestFree(dst, nullptr, it->Span(), cx, cy, ox, oy, tm);
+        MoveItemTo(it, dst->dir, ox, oy, tm);
     }
 }
 
@@ -1375,7 +1737,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             HBITMAP ob = (HBITMAP)SelectObject(mdc, hb);
             BitBlt(mdc, 0, 0, w, h, g_bgDC, rc.left, rc.top, SRCCOPY);
             {
-                Graphics g(mdc); SetupG(g);
+                Graphics g(mdc); SetupG(g, true);
                 g.TranslateTransform((REAL)-rc.left, (REAL)-rc.top);
                 g_paintRc = rc;
                 DrawSceneBelow(g, (int)g_stack.size());
@@ -1421,8 +1783,7 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_RESCAN: SetTimer(hw, TM_RESCAN, 400, nullptr); return 0;
     case WM_APP + 3: if (g_edit) EndRename(true); return 0;
     case WM_APP_FIRSTRUN:
-        g_set.firstRunDone = true; ScheduleSave();
-        ImportDesktop();
+        ChooseMode(AskMode());
         return 0;
     case WM_LBUTTONDOWN: {
         if (g_anim.on) return 0;
@@ -1466,8 +1827,9 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
             RECT P = PanelRect(g_modeItem);
             int c = std::max(1, (int)std::lround((pt.x - P.left - 2 * PAD) / (double)CW));
             int r = std::max(1, (int)std::lround((pt.y - P.top - HEAD - PAD) / (double)CH));
-            c = std::min(c, (int)((g_work.right - P.left - 2 * PAD) / CW));
-            r = std::min(r, (int)((g_work.bottom - P.top - HEAD - PAD) / CH));
+            const RECT& wk = g_mons[MonAt({(P.left + P.right) / 2, P.top + HEAD})].work;
+            c = std::min(c, (int)((wk.right - P.left - 2 * PAD) / CW));
+            r = std::min(r, (int)((wk.bottom - P.top - HEAD - PAD) / CH));
             c = std::max(c, 1); r = std::max(r, 1);
             if (c != g_modeItem->pc || r != g_modeItem->pr) {
                 RECT old = P;
@@ -1543,12 +1905,12 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         Hit h = HitTest(pt);
         std::wstring dir; int cx = -1, cy = -1;
         if (h.item && h.item->FolderLike()) dir = h.item->Dir();
-        else { dir = ContOfLayer(h.layer)->dir; CellAt(h.layer, pt, cx, cy); }
+        else { dir = ContOfLayer(h.layer)->dir; CellAt(h.layer, h.mon, pt, cx, cy); }
         if (!files.empty()) {
             std::wstring first = dir + L"\\" + FileName(files[0]);
             int ox = cx, oy = cy;
-            if (cx >= 0 && !Exists(first) && NearestFree(ContOfLayer(h.layer), nullptr, 1, cx, cy, ox, oy)) {
-                Entry& e = g_lay[Key(first)]; e.gx = ox; e.gy = oy;
+            if (cx >= 0 && !Exists(first) && NearestFree(ContOfLayer(h.layer), nullptr, 1, cx, cy, ox, oy, h.mon)) {
+                Entry& e = g_lay[Key(first)]; e.gx = ox; e.gy = oy; e.m = h.mon;
             }
         }
         ShellOp(FO_COPY, files, dir, FOF_NOCONFIRMMKDIR | FOF_RENAMEONCOLLISION | FOF_ALLOWUNDO);
@@ -1559,9 +1921,10 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == SPI_SETDESKWALLPAPER && g_set.wallMode == 0) { LoadBackground(); InvalidateRect(hw, nullptr, FALSE); }
         if (wp == SPI_SETWORKAREA) { UpdateMetrics(); RebuildAll(); }
         return 0;
+    case WM_DPICHANGED: return 0;   // 창 크기는 직접 관리
     case WM_DISPLAYCHANGE:
         UpdateMetrics();
-        SetWindowPos(hw, HWND_BOTTOM, 0, 0, g_screen.right, g_screen.bottom, SWP_NOACTIVATE);
+        SetWindowPos(hw, HWND_BOTTOM, g_virt.x, g_virt.y, g_screen.right, g_screen.bottom, SWP_NOACTIVATE);
         LoadBackground(); RebuildAll();
         return 0;
     case WM_ENDSESSION: if (wp) { SaveTree(&g_root); WriteLayoutFile(); } return 0;
@@ -1575,13 +1938,23 @@ static LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ───────────────────────── 폴더 감시 ─────────────────────────
-static DWORD WINAPI WatchThread(LPVOID) {
-    HANDLE h = FindFirstChangeNotificationW(g_dataDir.c_str(), TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    while (WaitForSingleObject(h, INFINITE) == WAIT_OBJECT_0) {
-        PostMessageW(g_hwnd, WM_APP_RESCAN, 0, 0);
-        if (!FindNextChangeNotification(h)) break;
+static DWORD WINAPI WatchThread(LPVOID p) {
+    LONG gen = (LONG)(LONG_PTR)p;
+    std::vector<std::wstring> dirs = {g_root.dir};
+    for (auto& d : g_root.extraDirs) dirs.push_back(d);
+    std::vector<HANDLE> hs;
+    for (auto& d : dirs) {
+        HANDLE h = FindFirstChangeNotificationW(d.c_str(), TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME);
+        if (h != INVALID_HANDLE_VALUE) hs.push_back(h);
     }
+    while (!hs.empty() && g_watchGen == gen) {
+        DWORD r = WaitForMultipleObjects((DWORD)hs.size(), hs.data(), FALSE, 1000);
+        if (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + hs.size()) {
+            if (g_watchGen == gen) PostMessageW(g_hwnd, WM_APP_RESCAN, 0, 0);
+            FindNextChangeNotification(hs[r - WAIT_OBJECT_0]);
+        }
+    }
+    for (HANDLE h : hs) FindCloseChangeNotification(h);
     return 0;
 }
 
@@ -1589,18 +1962,19 @@ static DWORD WINAPI WatchThread(LPVOID) {
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"PopupDesktop_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
-    SetProcessDPIAware();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     GdiplusStartupInput gsi; ULONG_PTR gtok;
     GdiplusStartup(&gtok, &gsi, nullptr);
 
     wchar_t ep[MAX_PATH]; GetModuleFileNameW(nullptr, ep, MAX_PATH); g_exePath = ep;
     g_baseDir = KnownFolder(FOLDERID_Documents) + L"\\팝업 바탕화면";
-    g_dataDir = g_baseDir + L"\\자료";
+    g_backupData = g_baseDir + L"\\자료";
+    g_desktopDir = KnownFolder(FOLDERID_Desktop);
+    g_publicDesktop = KnownFolder(FOLDERID_PublicDesktop);
     g_backupDir = g_baseDir + L"\\layout_백업";
     g_layoutPath = g_baseDir + L"\\layout.json";
     CreateDirectoryW(g_baseDir.c_str(), nullptr);
-    CreateDirectoryW(g_dataDir.c_str(), nullptr);
+    CreateDirectoryW(g_backupData.c_str(), nullptr);
     CreateDirectoryW(g_backupDir.c_str(), nullptr);
     LoadLayout();
     BackupLayoutOnStart();
@@ -1613,6 +1987,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     if (g_ff->GetLastStatus() != Ok) { delete g_ff; g_ff = FontFamily::GenericSansSerif()->Clone(); }
     g_font = new Font(g_ff, 12.5f * S, FontStyleRegular, UnitPixel);
     g_fontBold = new Font(g_ff, 15.0f * S, FontStyleBold, UnitPixel);
+    g_uiFont = CreateFontW(-(int)(13 * S), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Malgun Gothic");
+    { INITCOMMONCONTROLSEX ic = {sizeof ic, ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES}; InitCommonControlsEx(&ic); }
     g_editFont = CreateFontW(-(int)(12.5f * S), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Malgun Gothic");
 
     UpdateMetrics();
@@ -1623,19 +1999,24 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int) {
     wc.hIcon = LoadIcon(hi, MAKEINTRESOURCE(1));
     RegisterClassW(&wc);
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_ACCEPTFILES, wc.lpszClassName, L"팝업 바탕화면", WS_POPUP,
-                             g_screen.left, g_screen.top, g_screen.right - g_screen.left, g_screen.bottom - g_screen.top,
+                             g_virt.x, g_virt.y, g_screen.right - g_screen.left, g_screen.bottom - g_screen.top,
                              nullptr, nullptr, hi, nullptr);
     ChangeWindowMessageFilterEx(g_hwnd, WM_DROPFILES, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(g_hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(g_hwnd, 0x0049, MSGFLT_ALLOW, nullptr);
     LoadBackground();
+    g_root.extraDirs.clear();
+    if (g_set.mode == 0) {
+        g_dataDir = g_desktopDir;
+        if (!g_publicDesktop.empty() && IsDirPath(g_publicDesktop)) g_root.extraDirs.push_back(g_publicDesktop);
+    } else g_dataDir = g_backupData;
     g_root.dir = g_dataDir;
     LoadContainer(&g_root);
     AttachToDesktop();
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     AttachToDesktop();
-    CreateThread(nullptr, 0, WatchThread, nullptr, 0, nullptr);
-    if (!g_set.firstRunDone) PostMessageW(g_hwnd, WM_APP_FIRSTRUN, 0, 0);
+    CreateThread(nullptr, 0, WatchThread, (LPVOID)(LONG_PTR)g_watchGen, 0, nullptr);
+    if (g_set.mode < 0) PostMessageW(g_hwnd, WM_APP_FIRSTRUN, 0, 0);
     ScheduleSave();
 
     MSG m;
